@@ -1,0 +1,78 @@
+name: ARL在线
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag'
+        required: false
+        default: 'test'
+
+permissions:
+  contents: read
+
+jobs:
+  arl-online:
+    runs-on: ubuntu-20.04
+
+    steps:
+      # 1. 克隆 ARL-Next 仓库
+      - name: Clone ARL-Next repository
+        run: |
+          git clone https://github.com/owl234/ARL-Next
+          cd ARL-Next
+
+      # 2. 安装 Docker Compose 与 pnpm
+      - name: Install Docker Compose and pnpm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker-compose
+          npm install -g pnpm
+
+      # 3. 构建并启动后端所有服务
+      - name: Build and start backend services
+        run: |
+          cd ARL-Next
+          docker-compose -f docker-compose.dev.yml build
+          docker-compose -f docker-compose.dev.yml up -d
+          sleep 30
+
+      # 4. 启动前端开发服务器（后台运行）
+      - name: Start frontend dev server
+        run: |
+          cd ARL-Next/frontend
+          pnpm install
+          nohup pnpm run dev > ../../frontend-dev.log 2>&1 &
+          sleep 10
+
+      # 5. 通过 frp 将 5173 端口映射出去
+      - name: Expose frontend via frp
+        run: |
+          wget -q https://github.com/fatedier/frp/releases/download/v0.60.0/frp_0.60.0_linux_amd64.tar.gz
+          tar -xzf frp_0.60.0_linux_amd64.tar.gz
+          cd frp_0.60.0_linux_amd64
+          chmod 777 frpc
+          cat > arl-tunnel.ini <<EOF
+          transport.tls.enable = true
+          serverAddr = "181.193.92.249"
+          serverPort = 7000
+
+          auth.token = "public@!Dser"
+
+          [[proxies]]
+          name = "ARL-Web"
+          type = "tcp"
+          localIP = "127.0.0.1"
+          localPort = 5173
+          remotePort = 6022
+          EOF
+          nohup ./frpc -c arl-tunnel.ini > frpc.log 2>&1 &
+          sleep 5
+          echo "🎯 ARL 前端已暴露至: http://181.193.92.249:6022"
+          echo "   默认账号: admin / arlpass"
+
+      # 6. 保持 Runner 存活以便访问
+      - name: Keep alive and debug via tmate
+        uses: mxschmitt/action-tmate@v3

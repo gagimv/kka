@@ -1,0 +1,117 @@
+name: MissAV 爬虫（手动选择模式）
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '运行模式'
+        required: true
+        type: choice
+        default: 'both'
+        options:
+          - both        # 先抓列表，再抓详情
+          - list_only   # 仅抓取列表（写入 log.db）
+          - detail_only # 仅处理详情（从 log.db 读取）
+      urls:
+        description: '列表页URL，多个用英文逗号分隔（仅列表/全部模式需要）'
+        required: false
+        default: 'https://missav.ws/cn/new'
+      start_page:
+        description: '起始页码（留空从第1页开始）'
+        required: false
+        default: ''
+      end_page:
+        description: '结束页码（留空抓取所有页）'
+        required: false
+        default: ''
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装系统依赖与 Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 libgdk-pixbuf2.0-0 libxcomposite1 libxcursor1 \
+            libxdamage1 libxrandr2 libasound2t64 libatk-bridge2.0-0t64 \
+            libgtk-3-0t64 libxss1 libdrm2 libgbm1 libxkbcommon0 \
+            libatspi2.0-0 fonts-liberation libu2f-udev
+          sudo mkdir -p /etc/apt/keyrings
+          wget -qO- https://dl.google.com/linux/linux_signing_key.pub | \
+            gpg --dearmor | sudo tee /etc/apt/keyrings/google-chrome.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | \
+            sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+          echo "CHROME_BIN=$(which google-chrome-stable || which google-chrome)" >> $GITHUB_ENV
+
+      - name: 安装匹配的 ChromeDriver
+        run: |
+          set -e
+          CHROME_VERSION=$(google-chrome --version | awk '{print $3}')
+          wget -q "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chromedriver-linux64.zip" -O chromedriver.zip
+          unzip -o chromedriver.zip
+          sudo mv chromedriver-linux64/chromedriver /usr/local/bin/chromedriver
+          sudo chmod +x /usr/local/bin/chromedriver
+          rm -rf chromedriver-linux64 chromedriver.zip
+
+      - name: 安装 Python 依赖
+        run: |
+          pip install --upgrade pip
+          pip install undetected-chromedriver selenium certifi
+
+      # ---------- 列表阶段 ----------
+      - name: 运行列表抓取
+        if: ${{ github.event.inputs.mode == 'both' || github.event.inputs.mode == 'list_only' }}
+        env:
+          URLS: ${{ github.event.inputs.urls }}
+          START_PAGE: ${{ github.event.inputs.start_page }}
+          END_PAGE: ${{ github.event.inputs.end_page }}
+          CHROMEDRIVER_PATH: /usr/local/bin/chromedriver
+          CHROME_BIN: ${{ env.CHROME_BIN }}
+          HEADLESS: true
+          LIST_MODE: incremental   # 可改为 'full' 强制全量入队
+        run: python missav_list_crawler.py
+
+      # ---------- 详情阶段 ----------
+      - name: 运行详情抓取
+        if: ${{ github.event.inputs.mode == 'both' || github.event.inputs.mode == 'detail_only' }}
+        env:
+          CHROMEDRIVER_PATH: /usr/local/bin/chromedriver
+          CHROME_BIN: ${{ env.CHROME_BIN }}
+          HEADLESS: true
+          # NFO_DIR: ./nfo_files    # 如需生成 .nfo 取消注释
+        run: python missav_detail_crawler.py
+
+      - name: 提交更新的数据库
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add videos.db log.db comp.db
+          git diff --staged --quiet || git commit -m "Update databases [skip ci]"
+          git push
+
+      - name: 上传数据库产物（备份）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: missav-data
+          path: |
+            videos.db
+            log.db
+            comp.db
+            /tmp/missav_backup/
+          retention-days: 7

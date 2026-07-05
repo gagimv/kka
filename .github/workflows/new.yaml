@@ -1,4 +1,4 @@
-name: MissAV detail Scrape (Stable)
+name: MissAV List Scrape (Stable)
 
 on:
   schedule:
@@ -11,7 +11,10 @@ jobs:
     env:
       HEADLESS: true
       LIST_MODE: incremental
-      CHROME_VERSION: "124.0.6367.91"
+      # START_PAGE: 1
+      # END_PAGE: 10
+      # RESCRAPE: true
+      CHROME_VERSION: "124.0.6367.91"   # 与 undetected-chromedriver 3.5.5 兼容
 
     steps:
       - uses: actions/checkout@v4
@@ -33,13 +36,13 @@ jobs:
       - name: Install Python dependencies
         run: pip install undetected-chromedriver==3.5.5 selenium==4.15.2 certifi
 
-      - name: Setup Chrome
+      - name: Setup Chrome (指定稳定版本)
         uses: browser-actions/setup-chrome@v1
         with:
           browser: chrome
           chrome-version: ${{ env.CHROME_VERSION }}
 
-      - name: Install system dependencies
+      - name: Install all system dependencies for Chrome
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -48,32 +51,16 @@ jobs:
             libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
             libasound2t64 libx11-xcb1 libxcb-dri3-0 libxcb1
 
-      - name: Verify Chrome
+      - name: Verify Chrome installation
         run: |
-          CHROME_BIN=$(which google-chrome)
+          CHROME_BIN=$(which google-chrome || which chrome || which chromium-browser)
           echo "Chrome binary: $CHROME_BIN"
           $CHROME_BIN --version
+          # 快速测试 Chrome 能否正常启动 (headless)
           timeout 10 $CHROME_BIN --headless --disable-gpu --no-sandbox --dump-dom https://example.com || true
 
-      # 新增步骤：从 log.db 导出 urls.txt
-      - name: Generate urls.txt from log.db
-        run: |
-          python3 -c "
-          import sqlite3
-          conn = sqlite3.connect('log.db')
-          cur = conn.execute('SELECT url FROM pending')
-          urls = [row[0] for row in cur.fetchall()]
-          conn.close()
-          if not urls:
-              print('No pending URLs found, exiting.')
-              exit(1)
-          with open('urls.txt', 'w') as f:
-              f.write('\n'.join(urls))
-          print(f'Written {len(urls)} URLs to urls.txt')
-          "
-
       - name: Run scraper
-        run: python detail_scraper_v2.3.py
+        run: python missav_list_scraper2.py
 
       - name: Upload databases
         if: always()
@@ -81,4 +68,5 @@ jobs:
         with:
           name: databases
           path: |
+            log.db
             videos.db
