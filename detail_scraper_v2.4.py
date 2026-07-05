@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MissAV 详情抓取脚本 V2.5 (稳定版：修复锁库 / 超时 / 支持断点续抓)
+MissAV 详情抓取脚本 V2.6 (成功输出 URL + 进度增强)
+- 每条保存成功后立刻输出 URL 和番号
+- 进度日志附带最近成功的链接
+- 高并发稳定，支持断点续抓
 """
 
 import ssl
@@ -29,22 +32,23 @@ HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
 RESCRAPE = os.environ.get("RESCRAPE", "false").lower() == "true"
 
 class Config:
-    MAX_DETAIL_WORKERS = 4          # 降低并发，提高稳定性
+    MAX_DETAIL_WORKERS = 4
     DB_PATH = "videos.db"
-    PROGRESS_FILE = ".processed_urls.txt"  # 断点续抓记录
+    PROGRESS_FILE = ".processed_urls.txt"
     BACKUP_DIR = "/tmp/missav_backup"
     CLOUDFLARE_MAX_WAIT = 60
-    PAGE_LOAD_TIMEOUT = 60          # 缩短超时，加快重试
+    PAGE_LOAD_TIMEOUT = 60
     PAGE_LOAD_WAIT_DETAIL = 6
     M3U8_RETRY_TIMES = 5
     M3U8_RETRY_WAIT_BASE = 2
     DRIVER_MAX_PAGES = 15
     DETAIL_TASK_TIMEOUT = 120
 
-# ---------- 全局锁 ----------
+# ---------- 全局锁与缓存 ----------
 init_lock = threading.Lock()
 save_lock = threading.Lock()
 progress_lock = threading.Lock()
+print_lock = threading.Lock()  # 防止成功日志交错
 thread_local = threading.local()
 driver_pool = []
 
@@ -53,12 +57,12 @@ _driver_path_cache = None
 _chrome_bin_cache = None
 _chrome_version_cache = None
 
-# ---------- Chrome 查找 ----------
+# ---------- Chrome 查找与驱动 ----------
 def _get_chrome_version(browser_path):
     try:
         output = subprocess.check_output([browser_path, '--version'], stderr=subprocess.STDOUT).decode()
-        match = re.search(r'(\d+)\.', output)
-        return int(match.group(1)) if match else None
+        m = re.search(r'(\d+)\.', output)
+        return int(m.group(1)) if m else None
     except:
         return None
 
@@ -75,7 +79,7 @@ def _find_chrome_binary():
         p = shutil.which(name)
         if p:
             return p
-    print("[错误] 未找到 Chrome")
+    print("[错误] 未找到 Chrome 浏览器")
     sys.exit(1)
 
 def _download_and_patch_driver():
@@ -120,7 +124,7 @@ def _download_and_patch_driver():
         _chrome_bin_cache = chrome_bin
         return dpath, chrome_bin
 
-# ---------- 进度文件管理 ----------
+# ---------- 进度文件 ----------
 def load_processed_urls():
     if RESCRAPE:
         return set()
@@ -138,7 +142,7 @@ def mark_url_processed(url):
 def init_database():
     conn = sqlite3.connect(Config.DB_PATH)
     conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA busy_timeout=5000')   # 5秒忙等，减少锁错误
+    conn.execute('PRAGMA busy_timeout=5000')
     conn.execute('''CREATE TABLE IF NOT EXISTS videos (
                         code TEXT PRIMARY KEY,
                         title TEXT,
@@ -156,15 +160,13 @@ def migrate_database():
                 'actress':'TEXT','genres':'TEXT','series':'TEXT','studio':'TEXT',
                 'director':'TEXT','label':'TEXT'}
     conn = sqlite3.connect(Config.DB_PATH)
-    cur = conn.execute("PRAGMA table_info(videos)")
-    existing = {row[1] for row in cur.fetchall()}
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(videos)")}
     for col, t in new_cols.items():
         if col not in existing:
             try:
                 conn.execute(f"ALTER TABLE videos ADD COLUMN {col} {t}")
-                print(f"[数据库] 添加列: {col}")
             except Exception as e:
-                print(f"[数据库] 添加列失败 {col}: {e}")
+                print(f"[数据库] 添加列 {col} 失败: {e}")
     conn.commit()
     conn.close()
 
@@ -207,7 +209,7 @@ def save_video(details):
         conn.close()
     return True
 
-# ---------- Driver 管理 ----------
+# ---------- Driver 实例 ----------
 def _create_chrome_instance():
     dpath, cbin = _download_and_patch_driver()
     ver = _chrome_version_cache
@@ -269,7 +271,7 @@ def cleanup_drivers():
         except: pass
 atexit.register(cleanup_drivers)
 
-# ---------- 爬虫 ----------
+# ---------- 爬虫类 ----------
 class MissAVDetailScraper:
     def __init__(self, driver):
         self.driver = driver
@@ -297,7 +299,7 @@ class MissAVDetailScraper:
                 self.driver.get(url)
                 return True
             except Exception as e:
-                print(f"  [GET] 第{i+1}次超时/失败: {e}")
+                print(f"  [GET] 第{i+1}次超时: {e}")
                 if i == retries - 1:
                     print(f"  [GET] 连续失败，重置 driver")
                     reset_detail_driver()
@@ -337,7 +339,7 @@ class MissAVDetailScraper:
         return fields
 
     def get_video_details(self, video_url):
-        details = {'url':video_url,'code':'','cover':'','m3u8':''}
+        details = {'url':video_url, 'code':'', 'cover':'', 'm3u8':''}
         for k in ['description','release_date','raw_code','title','actress','genres','series','studio','director','label']:
             details[k] = ''
         m = re.search(r'/cn/([^/?#]+)', video_url, re.I)
@@ -416,25 +418,27 @@ def process_one_detail(url):
     time.sleep(random.uniform(1, 2))
     m = re.search(r'/cn/([^/?#]+)', url, re.I)
     if not m:
-        return False
+        return None  # 无法识别，返回 None 表示失败
     code = m.group(1).upper().replace('-UNCENSORED-LEAK', '')
     if is_already_processed(code):
-        return False  # 已有 m3u8，跳过
+        return None
     try:
         driver = get_detail_driver()
         scraper = MissAVDetailScraper(driver)
         details = scraper.get_video_details(url)
-        if details['code'] and details['m3u8']:
+        if details.get('code') and details.get('m3u8'):
             if save_video(details):
-                return True
+                with print_lock:
+                    print(f"✅ {details['code']} 已保存 → {url}")
+                return url  # 返回成功处理的 URL
     except Exception as e:
-        print(f"  [异常] {e}")
+        print(f"  [异常] {url}: {e}")
         reset_detail_driver()
-    return False
+    return None
 
 def main():
     print("="*60)
-    print("MissAV 详情抓取 V2.5 (稳定版)")
+    print("MissAV 详情抓取 V2.6 (成功日志增强)")
     print(f"无头: {HEADLESS} | 强制重抓: {RESCRAPE}")
     print("="*60)
 
@@ -451,7 +455,6 @@ def main():
         print("urls.txt 为空")
         sys.exit(1)
 
-    # 过滤已处理过的 URL
     remaining = [u for u in all_urls if u not in processed_urls]
     print(f"总链接: {len(all_urls)} | 已完成: {len(all_urls)-len(remaining)} | 剩余: {len(remaining)}")
     if not remaining:
@@ -460,10 +463,12 @@ def main():
 
     print("[主线程] 准备 chromedriver...")
     _download_and_patch_driver()
-    print("[主线程] 开始并发抓取\n")
+    print("[主线程] 开始并发抓取详情\n")
 
     total_success = 0
+    last_success_url = ""
     start = time.time()
+
     with ThreadPoolExecutor(max_workers=Config.MAX_DETAIL_WORKERS) as executor:
         futures = {}
         for url in remaining:
@@ -474,18 +479,22 @@ def main():
             url = futures[future]
             completed += 1
             try:
-                success = future.result(timeout=Config.DETAIL_TASK_TIMEOUT)
-                if success:
+                result = future.result(timeout=Config.DETAIL_TASK_TIMEOUT)
+                if result:  # 返回了成功处理的 URL
                     total_success += 1
+                    last_success_url = result
             except TimeoutError:
                 print(f"  ⚠ 任务超时: {url}")
             except Exception as e:
                 print(f"  [任务异常] {url}: {e}")
-            # 无论成功与否，都标记已处理，避免无限重试错误链接
+            # 无论成功与否，标记已处理，避免死循环
             mark_url_processed(url)
             if completed % 10 == 0:
                 elapsed = time.time() - start
-                print(f"  进度: {completed}/{len(remaining)} | 成功: {total_success} | 耗时 {elapsed:.0f}s")
+                progress_msg = f"  进度: {completed}/{len(remaining)} | 成功: {total_success} | 耗时 {elapsed:.0f}s"
+                if last_success_url:
+                    progress_msg += f" | 最近: {last_success_url}"
+                print(progress_msg)
 
     cleanup_drivers()
     print(f"\n任务结束。本次成功: {total_success}")
