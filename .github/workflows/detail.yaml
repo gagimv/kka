@@ -11,10 +11,7 @@ jobs:
     env:
       HEADLESS: true
       LIST_MODE: incremental
-      # START_PAGE: 1
-      # END_PAGE: 10
-      # RESCRAPE: true
-      CHROME_VERSION: "124.0.6367.91"   # 与 undetected-chromedriver 3.5.5 兼容
+      CHROME_VERSION: "124.0.6367.91"
 
     steps:
       - uses: actions/checkout@v4
@@ -36,13 +33,14 @@ jobs:
       - name: Install Python dependencies
         run: pip install undetected-chromedriver==3.5.5 selenium==4.15.2 certifi
 
-      - name: Setup Chrome (指定稳定版本)
+      - name: Setup Chrome
+        id: setup-chrome
         uses: browser-actions/setup-chrome@v1
         with:
           browser: chrome
           chrome-version: ${{ env.CHROME_VERSION }}
 
-      - name: Install all system dependencies for Chrome
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -51,12 +49,13 @@ jobs:
             libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
             libasound2t64 libx11-xcb1 libxcb-dri3-0 libxcb1
 
-      - name: Verify Chrome installation
+      - name: Verify Chrome
+        env:
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.browser-path }}
         run: |
-          echo "Chrome binary: $CHROME_PATH"
-          $CHROME_PATH --version
-          # 快速测试 Chrome 能否正常启动 (headless)
-          timeout 10 $CHROME_PATH --headless --disable-gpu --no-sandbox --dump-dom https://example.com || true
+          echo "Chrome binary: $CHROME_BIN"
+          $CHROME_BIN --version
+          timeout 10 $CHROME_BIN --headless --disable-gpu --no-sandbox --dump-dom https://example.com || true
 
       - name: Generate urls.txt from log.db
         run: |
@@ -76,7 +75,7 @@ jobs:
 
       - name: Run scraper
         env:
-          CHROME_BIN: ${{ env.CHROME_PATH }}
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.browser-path }}
         run: python detail_scraper_v2.3.py
 
       - name: Upload databases
