@@ -33,8 +33,7 @@ jobs:
       - name: Install Python dependencies
         run: pip install undetected-chromedriver==3.5.5 selenium==4.15.2 certifi
 
-      - name: Setup Chrome
-        id: setup-chrome
+      - name: Setup Chrome (指定版本)
         uses: browser-actions/setup-chrome@v1
         with:
           browser: chrome
@@ -49,9 +48,36 @@ jobs:
             libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
             libasound2t64 libx11-xcb1 libxcb-dri3-0 libxcb1
 
+      # ✅ 自动探测 Chrome 路径（硬编码备选 + which 兜底）
+      - name: Locate Chrome binary
+        run: |
+          # 优先检查 setup-chrome 的典型安装位置
+          CHROME_PATHS=(
+            "/opt/google/chrome/chrome"
+            "/usr/bin/google-chrome"
+            "/usr/bin/google-chrome-stable"
+            "/usr/bin/chromium-browser"
+            "/usr/local/bin/google-chrome"
+          )
+          FOUND=""
+          for p in "${CHROME_PATHS[@]}"; do
+            if [ -x "$p" ]; then
+              FOUND="$p"
+              break
+            fi
+          done
+          # 如果都没找到，尝试系统 PATH
+          if [ -z "$FOUND" ]; then
+            FOUND=$(which google-chrome || which chrome || which chromium-browser || true)
+          fi
+          if [ -z "$FOUND" ]; then
+            echo "❌ Chrome 二进制未找到！"
+            exit 1
+          fi
+          echo "✅ 使用 Chrome: $FOUND"
+          echo "CHROME_BIN=$FOUND" >> $GITHUB_ENV
+
       - name: Verify Chrome
-        env:
-          CHROME_BIN: ${{ steps.setup-chrome.outputs.browser-path }}
         run: |
           echo "Chrome binary: $CHROME_BIN"
           $CHROME_BIN --version
@@ -74,8 +100,6 @@ jobs:
           "
 
       - name: Run scraper
-        env:
-          CHROME_BIN: ${{ steps.setup-chrome.outputs.browser-path }}
         run: python detail_scraper_v2.3.py
 
       - name: Upload databases
