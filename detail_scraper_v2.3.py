@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MissAV 详情抓取脚本 V2.3 (仅数据库，无 NFO + 版本匹配)
+MissAV 详情抓取脚本 V2.4 (硬编码 Chrome 路径 + 版本匹配)
 - 从 urls.txt 读取详情页 URL，提取 m3u8、封面及完整元数据
 - 自动匹配 Chrome 驱动版本，适合 GitHub Actions
 - 只存入 videos.db，不生成 .nfo 文件
+- 支持通过 CHROME_BIN 环境变量或硬编码路径查找 Chrome
 """
 
 import ssl
@@ -55,6 +56,7 @@ _chrome_bin_cache = None
 _chrome_version_cache = None
 
 def _get_chrome_version(browser_path):
+    """获取 Chrome 主版本号"""
     try:
         output = subprocess.check_output([browser_path, '--version'], stderr=subprocess.STDOUT).decode()
         match = re.search(r'(\d+)\.', output)
@@ -65,22 +67,45 @@ def _get_chrome_version(browser_path):
     return None
 
 def _find_chrome_binary():
+    """
+    查找 Chrome 二进制文件，优先级：
+    1. 环境变量 CHROME_BIN
+    2. 硬编码的常用路径（适配 GitHub Actions setup-chrome）
+    3. 系统 PATH 搜索
+    """
+    # 1. 环境变量
     chrome_bin = os.environ.get("CHROME_BIN", "")
-    if chrome_bin and not os.path.isfile(chrome_bin):
-        print(f"[警告] CHROME_BIN 路径不存在: {chrome_bin}，自动查找")
-        chrome_bin = ""
-    if not chrome_bin:
-        for name in ["google-chrome", "google-chrome-stable", "chrome", "chromium-browser"]:
-            chrome_bin = shutil.which(name)
-            if chrome_bin:
-                print(f"[信息] 浏览器: {chrome_bin}")
-                break
-    if not chrome_bin:
-        print("[错误] 未找到 Chrome 浏览器")
-        sys.exit(1)
-    return chrome_bin
+    if chrome_bin and os.path.isfile(chrome_bin) and os.access(chrome_bin, os.X_OK):
+        print(f"[信息] 浏览器 (env): {chrome_bin}")
+        return chrome_bin
+
+    # 2. 硬编码路径（常见安装位置）
+    hardcoded_paths = [
+        "/opt/google/chrome/chrome",            # setup-chrome@v1 默认路径
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium-browser",
+        "/usr/local/bin/google-chrome",
+        "/snap/bin/chromium",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",  # macOS
+    ]
+    for path in hardcoded_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            print(f"[信息] 浏览器 (硬编码): {path}")
+            return path
+
+    # 3. 系统 PATH 搜索
+    for name in ["google-chrome", "google-chrome-stable", "chrome", "chromium-browser", "chromium"]:
+        chrome_bin = shutil.which(name)
+        if chrome_bin:
+            print(f"[信息] 浏览器 (which): {chrome_bin}")
+            return chrome_bin
+
+    print("[错误] 未找到 Chrome 浏览器，请安装或设置 CHROME_BIN 环境变量。")
+    sys.exit(1)
 
 def _download_and_patch_driver():
+    """下载/修补 chromedriver，使版本与浏览器匹配，并缓存路径"""
     global _driver_path_cache, _chrome_bin_cache, _chrome_version_cache
     with _driver_cache_lock:
         if _driver_path_cache:
@@ -158,6 +183,7 @@ def init_database():
     migrate_database()
 
 def migrate_database():
+    """为旧 videos 表添加新列（如果不存在）"""
     new_columns = {
         'description': 'TEXT',
         'release_date': 'TEXT',
@@ -182,6 +208,7 @@ def migrate_database():
     conn.close()
 
 def is_already_processed(code):
+    """检查 code 是否已有 m3u8 且非空，用于增量模式跳过"""
     if RESCRAPE:
         return False
     conn = sqlite3.connect(Config.DB_PATH)
@@ -342,6 +369,7 @@ class MissAVDetailScraper:
         return False
 
     def _extract_detail_fields(self):
+        """提取完整元数据字段"""
         fields = {
             'description': '', 'release_date': '', 'raw_code': '',
             'title': '', 'actress': '', 'genres': '', 'series': '',
@@ -423,6 +451,7 @@ class MissAVDetailScraper:
             'actress': '', 'genres': '', 'series': '', 'studio': '', 'director': '', 'label': ''
         }
         try:
+            # 从URL提取标准code（去除后缀）
             m = re.search(r'/cn/([^/?#]+)', video_url, re.I)
             if m:
                 raw = m.group(1).upper()
@@ -436,12 +465,14 @@ class MissAVDetailScraper:
                 return details
             time.sleep(Config.PAGE_LOAD_WAIT_DETAIL)
 
+            # 尝试从h1获取标题作为后备
             try:
                 h1 = self.driver.find_element(By.TAG_NAME, 'h1')
-                if h1.text.strip() != 'missav.ws':
+                if h1.text.strip() != 'missav.ws' and not details.get('title'):
                     details['title'] = h1.text.strip()
             except: pass
 
+            # 封面
             try:
                 og = self.driver.find_element(By.CSS_SELECTOR, 'meta[property="og:image"]')
                 details['cover'] = og.get_attribute('content')
@@ -449,12 +480,14 @@ class MissAVDetailScraper:
                 if details['code']:
                     details['cover'] = f"https://fourhoi.com/{details['code'].lower()}/cover-n.jpg"
 
+            # 提取详细元数据
             meta = self._extract_detail_fields()
             details.update(meta)
 
             if not details.get('title'):
                 details['title'] = meta.get('title', '')
 
+            # 查找 m3u8
             for attempt in range(1, Config.M3U8_RETRY_TIMES + 1):
                 m3u8_candidate = ""
                 try:
@@ -536,7 +569,7 @@ def process_one_detail(url):
 
 def main():
     print("="*60)
-    print("MissAV 详情抓取脚本 V2.3 (纯数据库版)")
+    print("MissAV 详情抓取脚本 V2.4 (硬编码 Chrome 路径)")
     print(f"无头模式: {HEADLESS} | 强制重抓: {RESCRAPE}")
     print("="*60)
 
