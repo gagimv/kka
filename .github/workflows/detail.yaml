@@ -10,7 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       HEADLESS: true
-      LIST_MODE: incremental
       CHROME_VERSION: "124.0.6367.91"
 
     steps:
@@ -48,64 +47,35 @@ jobs:
             libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
             libasound2t64 libx11-xcb1 libxcb-dri3-0 libxcb1
 
-      # ✅ 自动探测 Chrome 路径（硬编码备选 + which 兜底）
       - name: Locate Chrome binary
         run: |
-          # 优先检查 setup-chrome 的典型安装位置
-          CHROME_PATHS=(
-            "/opt/google/chrome/chrome"
-            "/usr/bin/google-chrome"
-            "/usr/bin/google-chrome-stable"
-            "/usr/bin/chromium-browser"
-            "/usr/local/bin/google-chrome"
-          )
-          FOUND=""
-          for p in "${CHROME_PATHS[@]}"; do
+          for p in /opt/google/chrome/chrome /usr/bin/google-chrome \
+                   /usr/bin/google-chrome-stable /usr/bin/chromium-browser; do
             if [ -x "$p" ]; then
-              FOUND="$p"
+              echo "CHROME_BIN=$p" >> $GITHUB_ENV
               break
             fi
           done
-          # 如果都没找到，尝试系统 PATH
-          if [ -z "$FOUND" ]; then
-            FOUND=$(which google-chrome || which chrome || which chromium-browser || true)
+          if [ -z "$CHROME_BIN" ]; then
+            CHROME_BIN=$(which google-chrome || which chrome || which chromium-browser)
+            echo "CHROME_BIN=$CHROME_BIN" >> $GITHUB_ENV
           fi
-          if [ -z "$FOUND" ]; then
-            echo "❌ Chrome 二进制未找到！"
-            exit 1
-          fi
-          echo "✅ 使用 Chrome: $FOUND"
-          echo "CHROME_BIN=$FOUND" >> $GITHUB_ENV
+          echo "Using Chrome: $CHROME_BIN"
 
       - name: Verify Chrome
         run: |
-          echo "Chrome binary: $CHROME_BIN"
           $CHROME_BIN --version
-          timeout 10 $CHROME_BIN --headless --disable-gpu --no-sandbox --dump-dom https://example.com || true
+          timeout 10 $CHROME_BIN --headless=new --disable-gpu --no-sandbox \
+            --disable-dbus --dump-dom https://example.com || true
 
-      - name: Generate urls.txt from log.db
-        run: |
-          python3 -c "
-          import sqlite3
-          conn = sqlite3.connect('log.db')
-          cur = conn.execute('SELECT url FROM pending')
-          urls = [row[0] for row in cur.fetchall()]
-          conn.close()
-          if not urls:
-              print('No pending URLs found, exiting.')
-              exit(1)
-          with open('urls.txt', 'w') as f:
-              f.write('\n'.join(urls))
-          print(f'Written {len(urls)} URLs to urls.txt')
-          "
+      # 删除了 Generate urls.txt from log.db 步骤
 
       - name: Run scraper
-        run: python detail_scraper_v2.3.py
+        run: python detail_scraper_v2.4.py
 
       - name: Upload databases
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: databases
-          path: |
-            videos.db
+          path: videos.db
