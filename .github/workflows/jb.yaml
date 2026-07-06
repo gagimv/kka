@@ -1,4 +1,4 @@
-name: MissAV detail Scrape (Stable)
+name: MissAV detail jb Scrape (Stable)
 
 on:
   schedule:
