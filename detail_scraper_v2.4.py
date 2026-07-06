@@ -445,14 +445,14 @@ def main():
     init_database()
     processed_urls = load_processed_urls()
 
-    url_file = "urls.txt"
+    url_file = "url1.txt"
     if not os.path.exists(url_file):
         print(f"错误：未找到 {url_file}")
         sys.exit(1)
     with open(url_file, 'r') as f:
         all_urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
     if not all_urls:
-        print("urls.txt 为空")
+        print("urls1.txt 为空")
         sys.exit(1)
 
     remaining = [u for u in all_urls if u not in processed_urls]
