@@ -35,7 +35,7 @@ LIST_MODE = os.environ.get("LIST_MODE", "incremental").lower()
 RESCRAPE = os.environ.get("RESCRAPE", "false").lower() == "true"
 
 class Config:
-    MAX_LIST_WORKERS = 4
+    MAX_LIST_WORKERS = 6
     DB_PATH = "videos.db"
     LOG_DB_PATH = "log.db"
     CLOUDFLARE_MAX_WAIT = 60
