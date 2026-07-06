@@ -71,7 +71,7 @@ jobs:
       # 删除了 Generate urls.txt from log.db 步骤
 
       - name: Run scraper
-        run: python detail_scraper_v2.4.py
+        run: python detail_scraper_v2.5.py
 
       - name: Upload databases
         if: always()
