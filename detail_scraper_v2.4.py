@@ -32,7 +32,7 @@ HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
 RESCRAPE = os.environ.get("RESCRAPE", "false").lower() == "true"
 
 class Config:
-    MAX_DETAIL_WORKERS = 4
+    MAX_DETAIL_WORKERS = 6
     DB_PATH = "videos.db"
     PROGRESS_FILE = ".processed_urls.txt"
     BACKUP_DIR = "/tmp/missav_backup"
