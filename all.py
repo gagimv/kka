@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MissAV 整合抓取脚本 V3.0（优化版）
+MissAV 整合抓取脚本 V3.1（修复判重 & 详情分离）
 - 自动抓取 urls.txt 中每个链接的前20页视频列表
 - 与 videos.db 对比（仅检查 code 是否存在），只对缺失的番号执行详情抓取
 - 详情结果存入 videos_new.db，同时在 videos.db 标记 code 已处理
 - 支持断点续抓（列表进度存入 log.db）
 - 高并发，环境变量：HEADLESS / RESCRAPE / MAX_LIST_PAGES
+- 修复：强制使用脚本所在目录的绝对路径，统一 code 为大写，解决已存在但误判为缺失的问题
 """
 
 import ssl
@@ -38,10 +39,13 @@ MAX_LIST_PAGES = int(os.environ.get("MAX_LIST_PAGES", "20"))
 
 # ---------- 全局配置 ----------
 class Config:
+    # 使用脚本所在目录的绝对路径，防止工作目录变动导致数据库找不到
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    DB_PATH = os.path.join(BASE_DIR, "videos.db")           # 仅用于 code 判重
+    DETAIL_DB_PATH = os.path.join(BASE_DIR, "videos_new.db")  # 存储完整详情
+    LOG_DB_PATH = os.path.join(BASE_DIR, "log.db")          # 列表进度
+
     MAX_LIST_WORKERS = 6
-    DB_PATH = "videos.db"                 # 仅用于 code 判重
-    DETAIL_DB_PATH = "videos_new.db"      # 存储完整详情
-    LOG_DB_PATH = "log.db"
     PAGE_LOAD_TIMEOUT = 90
     PAGE_LOAD_WAIT_LIST = 5
     CLOUDFLARE_MAX_WAIT = 60
@@ -65,7 +69,7 @@ _chrome_version_cache = None
 thread_local = threading.local()
 driver_pool = []
 
-# ---------- Chrome 驱动管理（无变化）----------
+# ---------- Chrome 驱动管理 ----------
 def _get_chrome_version(browser_path):
     try:
         output = subprocess.check_output([browser_path, '--version'], stderr=subprocess.STDOUT).decode()
@@ -215,19 +219,20 @@ def cleanup_drivers():
 import atexit
 atexit.register(cleanup_drivers)
 
-# ---------- 数据库初始化（重点修改）----------
+# ---------- 数据库初始化（修复路径 & 统一大写）----------
 def init_databases():
-    # 1) 判重数据库 videos.db —— 只要求 code 列存在即可
+    # 1) 判重数据库 videos.db —— 仅含 code 列，统一为大写
     conn = sqlite3.connect(Config.DB_PATH)
     conn.execute('PRAGMA journal_mode=WAL')
-    # 如果表不存在，创建仅含 code 的最小化表；如果表已存在则不改变结构
     conn.execute('''CREATE TABLE IF NOT EXISTS videos (
                         code TEXT PRIMARY KEY
                     )''')
+    # 将已有数据中的 code 统一转换为大写，避免大小写不一致导致的判重失误
+    conn.execute("UPDATE videos SET code = UPPER(code)")
     conn.commit()
     conn.close()
 
-    # 2) 详情数据库 videos_new.db —— 完整字段，用于存储新抓取的详情
+    # 2) 详情数据库 videos_new.db —— 完整字段
     conn = sqlite3.connect(Config.DETAIL_DB_PATH)
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('''CREATE TABLE IF NOT EXISTS videos (
@@ -251,7 +256,7 @@ def init_databases():
     conn.commit()
     conn.close()
 
-    # 3) 列表进度库 log.db （无变化）
+    # 3) 列表进度库 log.db
     conn = sqlite3.connect(Config.LOG_DB_PATH)
     conn.execute('''CREATE TABLE IF NOT EXISTS scrape_progress (
                         source_url TEXT PRIMARY KEY,
@@ -278,18 +283,23 @@ def update_list_progress(source_url, page, status):
         conn.commit()
         conn.close()
 
-# ---------- 判重函数：仅检查 code 是否存在 ----------
+# ---------- 判重函数（修复大小写）----------
 def is_video_complete(code):
-    """优化：只查询 code 是否存在于 videos.db（不关心其他字段）"""
+    """检查 code 是否已存在于 videos.db（不区分大小写，去空格）"""
+    clean_code = code.strip().upper()
+    if not clean_code:
+        return False
     conn = sqlite3.connect(Config.DB_PATH)
-    cur = conn.execute("SELECT 1 FROM videos WHERE code=?", (code,))
+    # 使用 UPPER(code) 进行查询，确保大小写不敏感
+    cur = conn.execute("SELECT 1 FROM videos WHERE UPPER(code) = ?", (clean_code,))
     row = cur.fetchone()
     conn.close()
     return row is not None
 
-# ---------- 详情保存：存入 videos_new.db，并在 videos.db 标记 code ----------
+# ---------- 详情保存：写入 videos_new.db，同时标记 videos.db ----------
 def save_video(details):
-    code = details.get('code')
+    # 统一 code 为大写
+    code = details.get('code', '').strip().upper()
     m3u8 = details.get('m3u8', '').strip()
     if not code or not m3u8:
         return False
@@ -318,14 +328,14 @@ def save_video(details):
         conn_new.commit()
         conn_new.close()
 
-        # 同时向判重库 videos.db 插入 code（若不存在），防止重复抓取
+        # 同时在判重库 videos.db 中插入 code（如果不存在），防止重复抓取
         conn_old = sqlite3.connect(Config.DB_PATH)
         conn_old.execute('INSERT OR IGNORE INTO videos (code) VALUES (?)', (code,))
         conn_old.commit()
         conn_old.close()
     return True
 
-# ---------- 列表抓取类（无变化）----------
+# ---------- 列表抓取类 ----------
 class MissAVListScraper:
     def __init__(self, driver):
         self.driver = driver
@@ -453,7 +463,8 @@ class MissAVListScraper:
                 for v in videos:
                     m = re.search(r'/cn/([^/?#]+)', v, re.I)
                     if m:
-                        code = m.group(1).upper().replace('-UNCENSORED-LEAK', '')
+                        # 提取并统一为大写，去除 -UNCENSORED-LEAK 后缀
+                        code = m.group(1).upper().replace('-UNCENSORED-LEAK', '').strip()
                         entries.append((code, v))
 
                 update_list_progress(url, current_page, 'in_progress')
@@ -477,7 +488,7 @@ class MissAVListScraper:
             print(f"  [列表错误] {e}")
         return entries, current_page
 
-# ---------- 详情抓取类（无变化）----------
+# ---------- 详情抓取类 ----------
 class MissAVDetailScraper:
     def __init__(self, driver):
         self.driver = driver
@@ -551,7 +562,7 @@ class MissAVDetailScraper:
         m = re.search(r'/cn/([^/?#]+)', video_url, re.I)
         if not m:
             return details
-        details['code'] = m.group(1).upper().replace('-UNCENSORED-LEAK', '')
+        details['code'] = m.group(1).upper().replace('-UNCENSORED-LEAK', '').strip()
         if not self.safe_get(video_url) or not self.wait_for_cloudflare():
             return details
         time.sleep(Config.PAGE_LOAD_WAIT_DETAIL)
@@ -636,7 +647,7 @@ def collect_list_entries(url, start_page, max_pages):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 def process_one_detail(code, url):
-    # 二次判重，避免并发重复
+    # 再次判重（并发安全）
     if is_video_complete(code):
         return None
     time.sleep(random.uniform(1, 2))
@@ -657,8 +668,9 @@ def process_one_detail(code, url):
 # ---------- 主流程 ----------
 def main():
     print("="*60)
-    print("MissAV 整合抓取脚本 V3.0（优化版）")
+    print("MissAV 整合抓取脚本 V3.1")
     print(f"无头: {HEADLESS} | 强制重抓: {RESCRAPE} | 列表最大页数: {MAX_LIST_PAGES}")
+    print(f"数据库目录: {Config.BASE_DIR}")
     print("="*60)
 
     init_databases()
@@ -691,8 +703,6 @@ def main():
     print(f"从 {url_file} 读取到 {len(all_urls)} 个链接，跳过已完成 {skip_count}，待处理列表 {len(list_tasks)}")
 
     all_entries = []
-    total_list_start = time.time()
-
     if list_tasks:
         print("[主线程] 准备 chromedriver...")
         _download_and_patch_driver()
