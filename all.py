@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MissAV 整合抓取脚本 V3.0
+MissAV 整合抓取脚本 V3.0（优化版）
 - 自动抓取 urls.txt 中每个链接的前20页视频列表
-- 与 videos.db 对比，只对缺失/未抓取的番号执行详情抓取
-- 支持断点续抓（列表进度存入 log.db，详情结果存入 videos.db）
+- 与 videos.db 对比（仅检查 code 是否存在），只对缺失的番号执行详情抓取
+- 详情结果存入 videos_new.db，同时在 videos.db 标记 code 已处理
+- 支持断点续抓（列表进度存入 log.db）
 - 高并发，环境变量：HEADLESS / RESCRAPE / MAX_LIST_PAGES
 """
 
@@ -13,7 +14,7 @@ try:
     import certifi
     ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
 except:
-    ssl._create_default_https_context = ssl._create_unverified_context
+    ssl._create_default_https_context = ssl._unverified_context
 
 import os, sys, re, json, time, threading, tempfile, shutil, sqlite3, random, subprocess
 from urllib.parse import urlparse
@@ -33,19 +34,17 @@ except ImportError:
 # ---------- 环境配置 ----------
 HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
 RESCRAPE = os.environ.get("RESCRAPE", "false").lower() == "true"
-MAX_LIST_PAGES = int(os.environ.get("MAX_LIST_PAGES", "20"))   # 每个列表链接抓取页数
+MAX_LIST_PAGES = int(os.environ.get("MAX_LIST_PAGES", "20"))
 
 # ---------- 全局配置 ----------
 class Config:
-    # 列表抓取
     MAX_LIST_WORKERS = 6
-    DB_PATH = "videos.db"
+    DB_PATH = "videos.db"                 # 仅用于 code 判重
+    DETAIL_DB_PATH = "videos_new.db"      # 存储完整详情
     LOG_DB_PATH = "log.db"
     PAGE_LOAD_TIMEOUT = 90
     PAGE_LOAD_WAIT_LIST = 5
     CLOUDFLARE_MAX_WAIT = 60
-
-    # 详情抓取
     MAX_DETAIL_WORKERS = 6
     PAGE_LOAD_WAIT_DETAIL = 6
     M3U8_RETRY_TIMES = 5
@@ -66,7 +65,7 @@ _chrome_version_cache = None
 thread_local = threading.local()
 driver_pool = []
 
-# ---------- Chrome 驱动管理 ----------
+# ---------- Chrome 驱动管理（无变化）----------
 def _get_chrome_version(browser_path):
     try:
         output = subprocess.check_output([browser_path, '--version'], stderr=subprocess.STDOUT).decode()
@@ -133,7 +132,6 @@ def _download_and_patch_driver():
         return dpath, chrome_bin
 
 def _create_list_driver():
-    """为列表抓取创建独立的驱动实例（线程用完即弃）"""
     dpath, cbin = _download_and_patch_driver()
     ver = _chrome_version_cache
     tmpdir = tempfile.mkdtemp(prefix="missav_list_")
@@ -156,7 +154,6 @@ def _create_list_driver():
     return driver, tmpdir
 
 def _create_detail_driver():
-    """创建一个用于详情抓取的驱动实例，并加入池管理"""
     dpath, cbin = _download_and_patch_driver()
     ver = _chrome_version_cache
     tmpdir = tempfile.mkdtemp(prefix="missav_detail_")
@@ -188,7 +185,6 @@ def _create_detail_driver():
     return driver
 
 def get_detail_driver():
-    """详情抓取专用驱动，利用 thread_local 缓存，自动轮换"""
     if hasattr(thread_local, 'driver') and hasattr(thread_local, 'page_count'):
         if thread_local.page_count >= Config.DRIVER_MAX_PAGES:
             reset_detail_driver()
@@ -219,10 +215,20 @@ def cleanup_drivers():
 import atexit
 atexit.register(cleanup_drivers)
 
-# ---------- 数据库初始化 ----------
+# ---------- 数据库初始化（重点修改）----------
 def init_databases():
-    # 详情库
+    # 1) 判重数据库 videos.db —— 只要求 code 列存在即可
     conn = sqlite3.connect(Config.DB_PATH)
+    conn.execute('PRAGMA journal_mode=WAL')
+    # 如果表不存在，创建仅含 code 的最小化表；如果表已存在则不改变结构
+    conn.execute('''CREATE TABLE IF NOT EXISTS videos (
+                        code TEXT PRIMARY KEY
+                    )''')
+    conn.commit()
+    conn.close()
+
+    # 2) 详情数据库 videos_new.db —— 完整字段，用于存储新抓取的详情
+    conn = sqlite3.connect(Config.DETAIL_DB_PATH)
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('''CREATE TABLE IF NOT EXISTS videos (
                         code TEXT PRIMARY KEY,
@@ -245,7 +251,7 @@ def init_databases():
     conn.commit()
     conn.close()
 
-    # 列表进度库（沿用原 log.db 结构，增加兼容性）
+    # 3) 列表进度库 log.db （无变化）
     conn = sqlite3.connect(Config.LOG_DB_PATH)
     conn.execute('''CREATE TABLE IF NOT EXISTS scrape_progress (
                         source_url TEXT PRIMARY KEY,
@@ -272,47 +278,54 @@ def update_list_progress(source_url, page, status):
         conn.commit()
         conn.close()
 
+# ---------- 判重函数：仅检查 code 是否存在 ----------
 def is_video_complete(code):
-    """检查番号是否已存在且 m3u8 非空（processed=1 且 m3u8 不为空）"""
+    """优化：只查询 code 是否存在于 videos.db（不关心其他字段）"""
     conn = sqlite3.connect(Config.DB_PATH)
-    cur = conn.execute("SELECT m3u8 FROM videos WHERE code=? AND processed=1", (code,))
+    cur = conn.execute("SELECT 1 FROM videos WHERE code=?", (code,))
     row = cur.fetchone()
     conn.close()
-    if row and row[0] and row[0].strip():
-        return True
-    return False
+    return row is not None
 
+# ---------- 详情保存：存入 videos_new.db，并在 videos.db 标记 code ----------
 def save_video(details):
     code = details.get('code')
     m3u8 = details.get('m3u8', '').strip()
     if not code or not m3u8:
         return False
     with save_lock:
-        conn = sqlite3.connect(Config.DB_PATH)
-        conn.execute('''INSERT OR REPLACE INTO videos (
-                            code, title, m3u8, cover, processed,
-                            description, release_date, raw_code,
-                            actress, genres, series, studio, director, label
-                        ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                     (code,
-                      details.get('title', ''),
-                      m3u8,
-                      details.get('cover', ''),
-                      details.get('description', ''),
-                      details.get('release_date', ''),
-                      details.get('raw_code', ''),
-                      details.get('actress', ''),
-                      details.get('genres', ''),
-                      details.get('series', ''),
-                      details.get('studio', ''),
-                      details.get('director', ''),
-                      details.get('label', '')
-                     ))
-        conn.commit()
-        conn.close()
+        # 写入完整详情到 videos_new.db
+        conn_new = sqlite3.connect(Config.DETAIL_DB_PATH)
+        conn_new.execute('''INSERT OR REPLACE INTO videos (
+                                code, title, m3u8, cover, processed,
+                                description, release_date, raw_code,
+                                actress, genres, series, studio, director, label
+                            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                         (code,
+                          details.get('title', ''),
+                          m3u8,
+                          details.get('cover', ''),
+                          details.get('description', ''),
+                          details.get('release_date', ''),
+                          details.get('raw_code', ''),
+                          details.get('actress', ''),
+                          details.get('genres', ''),
+                          details.get('series', ''),
+                          details.get('studio', ''),
+                          details.get('director', ''),
+                          details.get('label', '')
+                         ))
+        conn_new.commit()
+        conn_new.close()
+
+        # 同时向判重库 videos.db 插入 code（若不存在），防止重复抓取
+        conn_old = sqlite3.connect(Config.DB_PATH)
+        conn_old.execute('INSERT OR IGNORE INTO videos (code) VALUES (?)', (code,))
+        conn_old.commit()
+        conn_old.close()
     return True
 
-# ---------- 列表抓取类 ----------
+# ---------- 列表抓取类（无变化）----------
 class MissAVListScraper:
     def __init__(self, driver):
         self.driver = driver
@@ -391,12 +404,10 @@ class MissAVListScraper:
         return False
 
     def fetch_video_entries(self, url, start_page=1, max_pages=None):
-        """
-        返回 (code, detail_url) 列表，同时更新列表抓取进度
-        """
         entries = []
         print(f"  [列表] 开始 {url}（起始页 {start_page}，最多 {max_pages} 页）")
         base = url.rstrip('/')
+        current_page = start_page
         try:
             if start_page > 1:
                 first_url = f"{base}{'&' if '?' in base else '?'}page={start_page}"
@@ -415,7 +426,6 @@ class MissAVListScraper:
             elif max_pages:
                 total = start_page + max_pages - 1
 
-            current_page = start_page
             while True:
                 if current_page > start_page:
                     page_url = f"{base}{'&' if '?' in base else '?'}page={current_page}"
@@ -450,7 +460,6 @@ class MissAVListScraper:
 
                 if total and current_page >= total:
                     break
-                # 简单检查是否有下一页
                 has_next = False
                 for a in self.driver.find_elements(By.CSS_SELECTOR, 'a[href*="page="]'):
                     m = re.search(r'page=(\d+)', a.get_attribute('href'))
@@ -462,14 +471,13 @@ class MissAVListScraper:
                 current_page += 1
                 time.sleep(3)
 
-            # 完成
-            update_list_progress(url, current_page if 'current_page' in locals() else start_page, 'completed')
+            update_list_progress(url, current_page, 'completed')
             print(f"  [列表完成] 共 {len(entries)} 部")
         except Exception as e:
             print(f"  [列表错误] {e}")
-        return entries, current_page if 'current_page' in locals() else start_page
+        return entries, current_page
 
-# ---------- 详情抓取类 ----------
+# ---------- 详情抓取类（无变化）----------
 class MissAVDetailScraper:
     def __init__(self, driver):
         self.driver = driver
@@ -562,7 +570,6 @@ class MissAVDetailScraper:
         details.update(meta)
         if not details.get('title'):
             details['title'] = meta.get('title', '')
-        # m3u8 提取
         for attempt in range(1, Config.M3U8_RETRY_TIMES + 1):
             m3u8 = ""
             try:
@@ -615,7 +622,6 @@ class MissAVDetailScraper:
 
 # ---------- 任务处理 ----------
 def collect_list_entries(url, start_page, max_pages):
-    """在子线程中抓取一个列表链接，返回 (code, url) 列表和最终页码"""
     driver, tmp_dir = _create_list_driver()
     try:
         scraper = MissAVListScraper(driver)
@@ -630,8 +636,7 @@ def collect_list_entries(url, start_page, max_pages):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 def process_one_detail(code, url):
-    """抓取单个详情，成功返回 code，失败返回 None"""
-    # 再次检查是否已完成（防止并发重复）
+    # 二次判重，避免并发重复
     if is_video_complete(code):
         return None
     time.sleep(random.uniform(1, 2))
@@ -652,7 +657,7 @@ def process_one_detail(code, url):
 # ---------- 主流程 ----------
 def main():
     print("="*60)
-    print("MissAV 整合抓取脚本 V3.0")
+    print("MissAV 整合抓取脚本 V3.0（优化版）")
     print(f"无头: {HEADLESS} | 强制重抓: {RESCRAPE} | 列表最大页数: {MAX_LIST_PAGES}")
     print("="*60)
 
@@ -670,7 +675,6 @@ def main():
         print(f"错误：{url_file} 中没有有效 URL")
         sys.exit(1)
 
-    # 准备列表抓取任务
     list_tasks = []
     skip_count = 0
     for url in all_urls:
@@ -686,8 +690,7 @@ def main():
 
     print(f"从 {url_file} 读取到 {len(all_urls)} 个链接，跳过已完成 {skip_count}，待处理列表 {len(list_tasks)}")
 
-    # 第一阶段：并发抓取列表，收集所有番号和详情URL
-    all_entries = []   # (code, detail_url)
+    all_entries = []
     total_list_start = time.time()
 
     if list_tasks:
@@ -702,11 +705,9 @@ def main():
                     entries, last_page = future.result()
                     if entries:
                         all_entries.extend(entries)
-                        # 去重：保留每个code第一次出现的URL
                 except Exception as e:
                     print(f"任务异常 [{url}]: {e}")
 
-        # 去重，保留最早出现的url
         seen = {}
         for code, url in all_entries:
             if code not in seen:
@@ -714,14 +715,10 @@ def main():
         unique_entries = [(code, seen[code]) for code in seen]
         print(f"\n列表阶段共收集到 {len(unique_entries)} 个不重复番号。")
     else:
-        # 所有列表已完成，但可能仍有未抓取详情的番号？我们可以从videos.db中反向检查，但这里依赖列表抓取的新增。
-        # 如果所有列表都已完成，理论上不应再有新番号，但以防万一，我们允许RESCRAPE触发重新收集。
         print("所有列表已完成，跳过列表抓取阶段。")
         unique_entries = []
 
-    # 如果 RESCRAPE 但列表已完成，我们可能需要重新抓取列表。上一段已处理。
-    # 第二阶段：详情抓取
-    # 过滤掉已在videos.db中完整的番号
+    # 过滤：仅保留未在 videos.db 中出现的 code
     need_detail = []
     for code, url in unique_entries:
         if not is_video_complete(code):
@@ -730,7 +727,7 @@ def main():
     print(f"需要抓取详情的番号: {len(need_detail)} 个")
 
     if not need_detail:
-        print("所有番号已完整，任务结束。")
+        print("所有番号已存在，任务结束。")
         return
 
     print("[主线程] 开始并发抓取详情\n")
